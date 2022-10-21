@@ -568,3 +568,47 @@ def remove_orphan_folders():
     for path in rh_release_paths:
         if os.path.exists(path) and is_dir_empty(path):
             os.rmdir(path)
+
+
+def hide_secrets(args):
+    """
+    Replace secret values with asterisks.
+
+    This function takes a list of arguments which will be passed to
+    subscription-manager on the command line and returns a new list
+    that has any secret values obscured with asterisks.
+
+    :arg args: An argument list for subscription-manager which may contain
+        secret values.
+    :returns: A new list of arguments with secret values hidden.
+    """
+    obfuscation_string = "*" * 5
+    secret_args = frozenset(("--password", "--activationkey", "--token"))
+
+    sanitized_list = []
+    hide_next = False
+    for arg in args:
+        if hide_next:
+            # Second part of a two part secret argument (like --password *SECRET*)
+            arg = obfuscation_string
+            hide_next = False
+
+        elif arg in secret_args:
+            # First part of a two part secret argument (like *--password* SECRET)
+            hide_next = True
+
+        else:
+            # A secret argument in one part (like --password=SECRET)
+            for problem_arg in secret_args:
+                if arg.startswith(problem_arg + "="):
+                    arg = "{0}={1}".format(problem_arg, obfuscation_string)
+
+        sanitized_list.append(arg)
+
+    if hide_next:
+        loggerinst.debug(
+            "Passed arguments had unexpected secret argument,"
+            " '{0}', without a secret".format(sanitized_list[-1])  # lgtm[py/clear-text-logging-sensitive-data]
+        )
+
+    return sanitized_list

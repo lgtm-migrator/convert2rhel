@@ -460,3 +460,76 @@ def test_remove_orphan_folders(path_exists, list_dir, expected, tmpdir, monkeypa
 
     utils.remove_orphan_folders()
     assert os_remove_mock.call_count == expected
+
+@pytest.mark.parametrize(
+    ("secret",),
+    (
+        ("my favourite password",),
+        ("\\)(*&^%f %##@^%&*&^(",),
+        (" ",),
+        ("",),
+    ),
+)
+def test_hide_secrets(secret):
+    test_cmd = [
+        "register",
+        "--force",
+        "--username=jdoe",
+        "--password",
+        secret,
+        "--org=0123",
+        "--activationkey=%s" % secret,
+    ]
+    sanitized_cmd = utils.hide_secrets(test_cmd)
+    assert sanitized_cmd == [
+        "register",
+        "--force",
+        "--username=jdoe",
+        "--password",
+        "*****",
+        "--org=0123",
+        "--activationkey=*****",
+    ]
+
+
+def test_hide_secrets_no_secrets():
+    """Test that a list with no secrets to hide is not modified."""
+    test_cmd = [
+        "register",
+        "--force",
+        "--username=jdoe",
+        "--org=0123",
+    ]
+    sanitized_cmd = utils.hide_secrets(test_cmd)
+    assert sanitized_cmd == [
+        "register",
+        "--force",
+        "--username=jdoe",
+        "--org=0123",
+    ]
+
+
+def test_hide_secret_unexpected_input(caplog):
+    test_cmd = [
+        "register",
+        "--force",
+        "--password=SECRETS",
+        "--username=jdoe",
+        "--org=0123",
+        "--activationkey",
+        # This is missing the activationkey as the second argument
+    ]
+
+    sanitized_cmd = utils.hide_secrets(test_cmd)
+
+    assert sanitized_cmd == [
+        "register",
+        "--force",
+        "--password=*****",
+        "--username=jdoe",
+        "--org=0123",
+        "--activationkey",
+    ]
+    assert len(caplog.records) == 1
+    assert caplog.records[-1].levelname == "FILE"
+    assert "Passed arguments had unexpected secret argument," " '--activationkey', without a secret" in caplog.text
