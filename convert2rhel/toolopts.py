@@ -432,13 +432,15 @@ def warn_on_unsupported_options():
         )
         utils.ask_to_continue()
 
+
 def _log_command_used():
     """We want to log the command used for convert2rhel to make it easier to know what command was used
     when debugging the log files. Since we can't differenciate between the handlers we log to both stdout
     and the logfile
     """
-    command = ' '.join(sys.argv)
+    command = " ".join(sys.argv)
     loggerinst.info("convert2rhel command used:\n{}".format(utils.hide_secrets(command)))
+
 
 def options_from_config_files(cfg_path=None):
     """Parse the convert2rhel.ini configuration file.

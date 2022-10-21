@@ -1007,7 +1007,6 @@ class TestRegistrationCommand(object):
             reg_cmd()
 
 
-
 class TestReplaceSubscriptionManager(object):
     def test_replace_subscription_manager_skipped(self, monkeypatch, caplog, tool_opts):
         tool_opts.keep_rhsm = True
