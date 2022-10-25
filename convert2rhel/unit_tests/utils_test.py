@@ -461,6 +461,7 @@ def test_remove_orphan_folders(path_exists, list_dir, expected, tmpdir, monkeypa
 
     utils.remove_orphan_folders()
     assert os_remove_mock.call_count == expected
+
     io = [
         (
             ["convert2rhel", "--argument=with space in it", "--another"],
