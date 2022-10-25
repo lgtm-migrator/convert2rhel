@@ -56,3 +56,7 @@
   - name: install subscription manager
     how: ansible
     playbook: tests/ansible_collections/roles/install-submgr/main.yml
+
+/log_command_verification:
+  discover+:
+    test: log-command
