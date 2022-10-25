@@ -583,7 +583,7 @@ def hide_secrets(args):
     :returns: A new list of arguments with secret values hidden.
     """
     obfuscation_string = "*" * 5
-    secret_args = frozenset(("--password", "--activationkey", "--token"))
+    secret_args = frozenset(("--password", "--activationkey", "--token", "-p", "-k"))
 
     sanitized_list = []
     hide_next = False
