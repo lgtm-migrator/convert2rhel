@@ -64,4 +64,4 @@
 /log_command_verification:
   discover+:
     test: log-command
-    
+
