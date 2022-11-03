@@ -17,11 +17,20 @@
 
 import logging
 import os
-import sys
 
 from convert2rhel import backup, breadcrumbs, cert, checks, grub
 from convert2rhel import logger as logger_module
-from convert2rhel import pkghandler, redhatrelease, repo, special_cases, subscription, systeminfo, toolopts, utils
+from convert2rhel import (
+    pkghandler,
+    pkgmanager,
+    redhatrelease,
+    repo,
+    special_cases,
+    subscription,
+    systeminfo,
+    toolopts,
+    utils,
+)
 
 
 loggerinst = logging.getLogger(__name__)
@@ -66,9 +75,6 @@ def main():
     # initialize logging
     initialize_logger("convert2rhel.log", logger_module.LOG_DIR)
 
-    # prepare environment
-    utils.set_locale()
-
     # handle command line arguments
     toolopts.CLI()
 
@@ -91,13 +97,14 @@ def main():
         pkghandler.clean_yum_metadata()
 
         # check the system prior the conversion (possible inhibit)
-        checks.perform_pre_checks()
+        checks.perform_system_checks()
 
         # backup system release file before starting conversion process
         loggerinst.task("Prepare: Backup System")
         redhatrelease.system_release_file.backup()
         redhatrelease.os_release_file.backup()
         repo.backup_yum_repos()
+        repo.backup_varsdir()
 
         # begin conversion process
         process_phase = ConversionPhase.PRE_PONR_CHANGES
@@ -138,7 +145,6 @@ def main():
     except (Exception, SystemExit, KeyboardInterrupt) as err:
         # Catching the three exception types separately due to python 2.4
         # (RHEL 5) - 2.7 (RHEL 7) compatibility.
-
         utils.log_traceback(toolopts.tool_opts.debug)
         no_changes_msg = "No changes were made to the system."
         breadcrumbs.breadcrumbs.finish_collection(success=False)
@@ -194,6 +200,10 @@ def pre_ponr_conversion():
     loggerinst.task("Convert: Resolve possible edge cases")
     special_cases.check_and_resolve()
 
+    # Import the Red Hat GPG Keys for installing Subscription-manager and for later.
+    loggerinst.task("Convert: Import Red Hat GPG keys")
+    pkghandler.install_gpg_keys()
+
     rhel_repoids = []
     if not toolopts.tool_opts.no_rhsm:
         loggerinst.task("Convert: Subscription Manager - Download packages")
@@ -231,13 +241,11 @@ def pre_ponr_conversion():
 
 def post_ponr_conversion():
     """Perform main steps for system conversion."""
-
-    loggerinst.task("Convert: Import Red Hat GPG keys")
-    pkghandler.install_gpg_keys()
+    transaction_handler = pkgmanager.create_transaction_handler()
+    loggerinst.task("Convert: Replace system packages")
+    transaction_handler.run_transaction()
     loggerinst.task("Convert: Prepare kernel")
     pkghandler.preserve_only_rhel_kernel()
-    loggerinst.task("Convert: Replace packages")
-    pkghandler.replace_non_red_hat_packages()
     loggerinst.task("Convert: List remaining non-Red Hat packages")
     pkghandler.list_non_red_hat_pkgs_left()
     loggerinst.task("Convert: Configure the bootloader")
@@ -264,6 +272,7 @@ def rollback_changes():
     loggerinst.warning("Abnormal exit! Performing rollback ...")
     subscription.rollback()
     backup.changed_pkgs_control.restore_pkgs()
+    repo.restore_varsdir()
     repo.restore_yum_repos()
     redhatrelease.system_release_file.restore()
     redhatrelease.os_release_file.restore()
@@ -271,9 +280,12 @@ def rollback_changes():
     pkghandler.versionlock_file.restore()
     system_cert = cert.SystemCert()
     system_cert.remove()
+    try:
+        backup.backup_control.pop_all()
+    except IndexError as e:
+        if e.args[0] == "No backups to restore":
+            loggerinst.info("During rollback there were no backups to restore")
+        else:
+            raise
 
     return
-
-
-if __name__ == "__main__":
-    sys.exit(main())

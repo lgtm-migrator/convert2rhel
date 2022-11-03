@@ -101,16 +101,18 @@ class TestUtils(unittest.TestCase):
     @unit_tests.mock(
         utils,
         "download_pkg",
-        lambda pkg, dest, reposdir, enable_repos, disable_repos, set_releasever: "/filepath/",
+        lambda pkg, dest, reposdir, enable_repos, disable_repos, set_releasever, custom_releasever, varsdir: "/filepath/",
     )
     def test_download_pkgs(self):
         paths = utils.download_pkgs(
-            ["pkg1", "pkg2"],
-            "/dest/",
-            "/reposdir/",
-            ["repo1"],
-            ["repo2"],
-            False,
+            pkgs=["pkg1", "pkg2"],
+            dest="/dest/",
+            reposdir="/reposdir/",
+            enable_repos=["repo1"],
+            disable_repos=["repo2"],
+            set_releasever=False,
+            custom_releasever=8,
+            varsdir="/tmp",
         )
 
         self.assertEqual(paths, ["/filepath/", "/filepath/"])
@@ -130,12 +132,14 @@ class TestUtils(unittest.TestCase):
         disable_repos = ["*"]
 
         path = utils.download_pkg(
-            "kernel",
+            pkg="kernel",
             dest=dest,
             reposdir=reposdir,
             enable_repos=enable_repos,
             disable_repos=disable_repos,
             set_releasever=True,
+            custom_releasever="8",
+            varsdir="/tmp",
         )
 
         self.assertEqual(
@@ -148,6 +152,7 @@ class TestUtils(unittest.TestCase):
                 "--enablerepo=repo1",
                 "--enablerepo=repo2",
                 "--releasever=8",
+                "--setopt=varsdir=/tmp",
                 "--setopt=module_platform_id=platform:el8",
                 "kernel",
             ],
@@ -155,6 +160,16 @@ class TestUtils(unittest.TestCase):
         )
         self.assertTrue(path)  # path is not None (which is the case of unsuccessful download)
 
+    @unit_tests.mock(system_info, "releasever", None)
+    def test_download_pkg_assertion_error(self):
+        with pytest.raises(AssertionError, match="custom_releasever or system_info.releasever must be set."):
+            utils.download_pkg(
+                pkg="kernel",
+                set_releasever=True,
+                custom_releasever=None,
+            )
+
+    @unit_tests.mock(system_info, "releasever", "7Server")
     @unit_tests.mock(system_info, "version", namedtuple("Version", ["major", "minor"])(7, 0))
     @unit_tests.mock(utils, "run_cmd_in_pty", RunSubprocessMocked(ret_code=1))
     @unit_tests.mock(os, "environ", {"CONVERT2RHEL_UNSUPPORTED_INCOMPLETE_ROLLBACK": "1"})
@@ -163,12 +178,14 @@ class TestUtils(unittest.TestCase):
 
         self.assertEqual(path, None)
 
+    @unit_tests.mock(system_info, "releasever", "7Server")
     @unit_tests.mock(system_info, "version", namedtuple("Version", ["major", "minor"])(7, 0))
     @unit_tests.mock(utils, "run_cmd_in_pty", RunSubprocessMocked(ret_code=1))
     @unit_tests.mock(os, "environ", {})
     def test_download_pkg_failed_download_exit(self):
         self.assertRaises(SystemExit, utils.download_pkg, "kernel")
 
+    @unit_tests.mock(system_info, "releasever", "7Server")
     @unit_tests.mock(system_info, "version", namedtuple("Version", ["major", "minor"])(7, 0))
     @unit_tests.mock(utils, "run_cmd_in_pty", RunSubprocessMocked(ret_code=0))
     def test_download_pkg_incorrect_output(self):
@@ -387,6 +404,67 @@ def test_get_rpm_header(monkeypatch):
     assert utils.get_rpm_header("/path/to.rpm", _open=mock.mock_open())[rpm.RPMTAG_NAME] == "pkg1"
 
 
+class TestFindKeys:
+    gpg_key = os.path.realpath(
+        os.path.join(os.path.dirname(__file__), "../data/version-independent/gpg-keys/RPM-GPG-KEY-redhat-release")
+    )
+
+    def test_find_keyid(self):
+        assert utils.find_keyid(self.gpg_key) == "fd431d51"
+
+    def test_find_keyid_bad_file(self, tmpdir):
+        gpg_key = os.path.join(str(tmpdir), "badkeyfile")
+        with open(gpg_key, "w") as f:
+            f.write("bad data\n")
+
+        with pytest.raises(
+            utils.ImportGPGKeyError, match="Failed to import the rpm gpg key into a temporary keyring.*"
+        ):
+            utils.find_keyid(gpg_key)
+
+    def test_find_keyid_gpg_bad_keyring(self, monkeypatch):
+        class MockedRunSubProcess(object):
+            def __init__(self):
+                self.called = 0
+
+            def __call__(self, *args, **kwargs):
+                # Fail on the second call
+                self.called += 1
+                if self.called == 2:
+                    return ("", 1)
+
+                return real_run_subprocess(*args, **kwargs)
+
+        real_run_subprocess = utils.run_subprocess
+        monkeypatch.setattr(utils, "run_subprocess", MockedRunSubProcess())
+
+        with pytest.raises(
+            utils.ImportGPGKeyError, match="Failed to read the temporary keyring with the rpm gpg key:.*"
+        ):
+            utils.find_keyid(self.gpg_key)
+
+    def test_find_keyid_no_gpg_output(self, monkeypatch):
+        class MockedRunSubProcess(object):
+            def __init__(self):
+                self.called = 0
+
+            def __call__(self, *args, **kwargs):
+                # Fail on the second call
+                self.called += 1
+                if self.called == 2:
+                    return ("", 0)
+
+                return real_run_subprocess(*args, **kwargs)
+
+        real_run_subprocess = utils.run_subprocess
+        monkeypatch.setattr(utils, "run_subprocess", MockedRunSubProcess())
+
+        with pytest.raises(
+            utils.ImportGPGKeyError, match="Unable to determine the gpg keyid for the rpm key file: %s" % self.gpg_key
+        ):
+            utils.find_keyid(self.gpg_key)
+
+
 @pytest.mark.parametrize("dir_name", ("/existing", "/nonexisting", None))
 # TODO change to tmpdir fixture
 def test_remove_tmp_dir(monkeypatch, dir_name, caplog, tmpdir):
@@ -461,13 +539,6 @@ def test_remove_orphan_folders(path_exists, list_dir, expected, tmpdir, monkeypa
 
     utils.remove_orphan_folders()
     assert os_remove_mock.call_count == expected
-
-    io = [
-        (
-            ["convert2rhel", "--argument=with space in it", "--another"],
-            'convert2rhel --argument="with space in it" --another',
-        ),
-    ]
 
 
 @pytest.mark.parametrize(

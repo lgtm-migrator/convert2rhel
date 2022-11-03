@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
 
 import pexpect
@@ -36,6 +37,10 @@ from convert2rhel import i18n
 
 
 loggerinst = logging.getLogger(__name__)
+
+
+class ImportGPGKeyError(Exception):
+    """Raised for failures during the rpm import of gpg keys."""
 
 
 class Color(object):
@@ -399,9 +404,23 @@ def download_pkgs(
     enable_repos=None,
     disable_repos=None,
     set_releasever=True,
+    custom_releasever=None,
+    varsdir=None,
 ):
     """A wrapper for the download_pkg function allowing to download multiple packages."""
-    return [download_pkg(pkg, dest, reposdir, enable_repos, disable_repos, set_releasever) for pkg in pkgs]
+    return [
+        download_pkg(
+            pkg,
+            dest,
+            reposdir,
+            enable_repos,
+            disable_repos,
+            set_releasever,
+            custom_releasever,
+            varsdir,
+        )
+        for pkg in pkgs
+    ]
 
 
 def download_pkg(
@@ -411,13 +430,33 @@ def download_pkg(
     enable_repos=None,
     disable_repos=None,
     set_releasever=True,
+    custom_releasever=None,
+    varsdir=None,
 ):
-    """Download an rpm using yumdownloader and return its filepath. If not successful, return None.
+    """Download an rpm using yumdownloader and return its filepath.
 
-    The enable_repos and disable_repos function parameters accept lists. If used, the repos are passed to the
-    --enablerepo and --disablerepo yumdownloader options, respectively.
+    This function accepts a single rpm name as a string to be downloaded through
+    the yumdownloader binary.
 
-    Pass just a single rpm name as a string to the pkg parameter.
+    :param pkg: The packaged that will be downloaded.
+    :type pkg: str
+    :param dest: The destination to download te package. Defaults to `TMP_DIR`
+    :type dest: str
+    :param reposdir: The folder with custom repositories to download.
+    :type reposdir: str
+    :param enable_repos: The repositories to enabled during the download.
+    :type enable_repos: list[str]
+    :param disable_repos: The repositories to disable during the download.
+    :type disable_repos: list[str]
+    :param set_systeminfo_releasever: If it's necessary to use the releasever stored in  SystemInfo.releasever.
+    :type set_systeminfo_releasever: bool
+    :param custom_releasever: A custom releasever to use. An alternative to set_systeminfo_releasever.
+    :type custom_releasever: int | str
+    :param varsdir: The path to the variables directory.
+    :type varsdir: str
+
+    :return: The filepath of the downloaded package.
+    :rtype: str | None
     """
     from convert2rhel.systeminfo import system_info
 
@@ -436,8 +475,17 @@ def download_pkg(
         for repo in enable_repos:
             cmd.append("--enablerepo=%s" % repo)
 
-    if set_releasever and system_info.releasever:
-        cmd.append("--releasever=%s" % system_info.releasever)
+    if set_releasever:
+        if not custom_releasever and not system_info.releasever:
+            raise AssertionError("custom_releasever or system_info.releasever must be set.")
+
+        if custom_releasever:
+            cmd.append("--releasever=%s" % custom_releasever)
+        else:
+            cmd.append("--releasever=%s" % system_info.releasever)
+
+    if varsdir:
+        cmd.append("--setopt=varsdir=%s" % varsdir)
 
     if system_info.version.major == 8:
         cmd.append("--setopt=module_platform_id=platform:el8")
@@ -520,6 +568,82 @@ def get_rpm_header(rpm_path, _open=open):
     with _open(rpm_path) as rpmfile:
         rpmhdr = ts.hdrFromFdno(rpmfile)
     return rpmhdr
+
+
+def find_keyid(keyfile):
+    """
+    Find the keyid as used by rpm from a gpg key file.
+
+    :arg keyfile: The filename that contains the gpg key.
+
+    .. note:: rpm doesn't use the full gpg fingerprint so don't use that even though it would be
+        more secure.
+    """
+    # Newer gpg versions have several easier ways to do this:
+    # gpg --with-colons --show-keys keyfile (Can pipe keyfile)
+    # gpg --with-colons --import-options show-only --import keyfile  (Can pipe keyfile)
+    # gpg --with-colons --import-options import-show --dry-run --import keyfile (Can pipe keyfile)
+    # But as long as we need to work on RHEL7 we can't use those.
+
+    # GPG needs a writable diretory to put default config files
+    temporary_dir = tempfile.mkdtemp()
+    temporary_keyring = os.path.join(temporary_dir, "keyring")
+
+    try:
+        # Step 1: Import the key into a temporary keyring (the list-keys command can't operate on
+        # a single asciiarmored key)
+        output, ret_code = run_subprocess(
+            [
+                "gpg",
+                "--no-default-keyring",
+                "--keyring",
+                temporary_keyring,
+                "--homedir",
+                temporary_dir,
+                "--import",
+                keyfile,
+            ],
+            print_output=False,
+        )
+        if ret_code != 0:
+            raise ImportGPGKeyError("Failed to import the rpm gpg key into a temporary keyring: %s" % output)
+
+        # Step 2: Print the information about the keys in the temporary keyfile.
+        # --with-colons give us guaranteed machine parsable, stable output.
+        output, ret_code = run_subprocess(
+            [
+                "gpg",
+                "--no-default-keyring",
+                "--keyring",
+                temporary_keyring,
+                "--homedir",
+                temporary_dir,
+                "--list-keys",
+                "--with-colons",
+            ],
+            print_output=False,
+        )
+        if ret_code != 0:
+            raise ImportGPGKeyError("Failed to read the temporary keyring with the rpm gpg key: %s" % output)
+    finally:
+        # Remove the temporary keyring.  We can't use the context manager for this because it isn't
+        # available on Python-2.7 (RHEL7)
+        shutil.rmtree(temporary_dir)
+
+    keyid = None
+    for line in output.splitlines():
+        if line.startswith("pub"):
+            fields = line.split(":")
+            fingerprint = fields[4]
+            # The keyid as represented in rpm's fake packagename is only the last 8 hex digits
+            # Example: gpg-pubkey-d651ff2e-5dadbbc1
+            keyid = fingerprint[-8:]
+            break
+
+    if not keyid:
+        raise ImportGPGKeyError("Unable to determine the gpg keyid for the rpm key file: %s" % keyfile)
+
+    return keyid.lower()
 
 
 def set_locale():

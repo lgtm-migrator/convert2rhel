@@ -15,19 +15,20 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 import itertools
 import logging
 import os
 import os.path
 import re
+import shutil
 import tempfile
 
 import rpm
 
-from convert2rhel import __version__ as convert2rhel_version
+from convert2rhel import __version__ as installed_convert2rhel_version
 from convert2rhel import grub, pkgmanager, utils
 from convert2rhel.pkghandler import (
+    _package_version_cmp,
     call_yum_cmd,
     compare_package_versions,
     get_installed_pkg_objects,
@@ -46,7 +47,27 @@ KERNEL_REPO_RE = re.compile(r"^.+:(?P<version>.+).el.+$")
 KERNEL_REPO_VER_SPLIT_RE = re.compile(r"\W+")
 BAD_KERNEL_RELEASE_SUBSTRINGS = ("uek", "rt", "linode")
 
+RPM_GPG_KEY_PATH = os.path.join(utils.DATA_DIR, "gpg-keys", "RPM-GPG-KEY-redhat-release")
+# The SSL certificate of the https://cdn.redhat.com/ server
+SSL_CERT_PATH = os.path.join(utils.DATA_DIR, "redhat-uep.pem")
+CDN_URL = "https://cdn.redhat.com/content/public/convert2rhel/$releasever/$basearch/os/"
+CONVERT2RHEL_REPO_CONTENT = """\
+[convert2rhel]
+name=Convert2RHEL Repository
+baseurl=%s
+gpgcheck=1
+enabled=1
+sslcacert=%s
+gpgkey=file://%s""" % (
+    CDN_URL,
+    SSL_CERT_PATH,
+    RPM_GPG_KEY_PATH,
+)
+
+PKG_NEVR = r"\b(\S+)-(?:([0-9]+):)?(\S+)-(\S+)\b"
+
 LINK_KMODS_RH_POLICY = "https://access.redhat.com/third-party-software-support"
+LINK_PREVENT_KMODS_FROM_LOADING = "https://access.redhat.com/solutions/41278"
 # The kernel version stays the same throughout a RHEL major version
 COMPATIBLE_KERNELS_VERS = {
     6: "2.6.32",
@@ -54,8 +75,46 @@ COMPATIBLE_KERNELS_VERS = {
     8: "4.18.0",
 }
 
+# Python 2.6 compatibility.
+# This code is copied from Pthon-3.10's functools module,
+# licensed under the Python Software Foundation License, version 2
+try:
+    from functools import cmp_to_key
+except ImportError:
 
-def perform_pre_checks():
+    def cmp_to_key(mycmp):
+        """Convert a cmp= function into a key= function"""
+
+        class K(object):
+            __slots__ = ["obj"]
+
+            def __init__(self, obj):
+                self.obj = obj
+
+            def __lt__(self, other):
+                return mycmp(self.obj, other.obj) < 0
+
+            def __gt__(self, other):
+                return mycmp(self.obj, other.obj) > 0
+
+            def __eq__(self, other):
+                return mycmp(self.obj, other.obj) == 0
+
+            def __le__(self, other):
+                return mycmp(self.obj, other.obj) <= 0
+
+            def __ge__(self, other):
+                return mycmp(self.obj, other.obj) >= 0
+
+            __hash__ = None
+
+        return K
+
+
+# End of PSF Licensed code
+
+
+def perform_system_checks():
     """Early checks after system facts should be added here."""
 
     check_custom_repos_are_valid()
@@ -72,84 +131,95 @@ def perform_pre_checks():
 def perform_pre_ponr_checks():
     """Late checks before ponr should be added here."""
     ensure_compatibility_of_kmods()
+    validate_package_manager_transaction()
 
 
 def check_convert2rhel_latest():
-    """Make sure that we are running the latest version of convert2rhel"""
-    gpg_path = os.path.join(utils.DATA_DIR, "gpg-keys", "RPM-GPG-KEY-redhat-release")
-    ssl_cert_path = os.path.join(utils.DATA_DIR, "redhat-uep.pem")
-    repo_content = (
-        "[convert2rhel]\n"
-        "name=Convert2RHEL Repository\n"
-        "baseurl=https://cdn.redhat.com/content/public/convert2rhel/$releasever/x86_64/os/\n"
-        "gpgcheck=1\n"
-        "enabled=1\n"
-        "sslcacert=%s\n"
-        "gpgkey=file://%s\n" % (ssl_cert_path, gpg_path)
-    )
+    """Make sure that we are running the latest downstream version of convert2rhel"""
+    logger.task("Prepare: Checking if this is the latest version of Convert2RHEL")
+
+    if not system_info.has_internet_access:
+        logger.warning("Skipping the check because no internet connection has been detected.")
+        return
+
+    repo_dir = tempfile.mkdtemp(prefix="convert2rhel_repo.", dir=utils.TMP_DIR)
+    repo_path = os.path.join(repo_dir, "convert2rhel.repo")
+    store_content_to_file(filename=repo_path, content=CONVERT2RHEL_REPO_CONTENT)
 
     cmd = [
         "repoquery",
+        "--disablerepo=*",
+        "--enablerepo=convert2rhel",
         "--releasever=%s" % system_info.version.major,
+        "--setopt=reposdir=%s" % repo_dir,
+        "convert2rhel",
     ]
 
-    repo_dir = tempfile.mkdtemp(prefix="convert2rhel_repo.", dir=utils.TMP_DIR)
+    # Note: This is safe because we're creating in utils.TMP_DIR which is hardcoded to
+    # /var/lib/convert2rhel which does not have any world-writable directory components.
     utils.mkdir_p(repo_dir)
-    repo_path = os.path.join(repo_dir, "convert2rhel.repo")
-    store_content_to_file(filename=repo_path, content=repo_content)
 
-    cmd.append("--setopt=reposdir=%s" % repo_dir)
-    cmd.append("convert2rhel")
-
-    raw_output_convert2rhel_versions, return_code = run_subprocess(cmd, print_output=False)
+    try:
+        raw_output_convert2rhel_versions, return_code = run_subprocess(cmd, print_output=False)
+    finally:
+        shutil.rmtree(repo_dir)
 
     if return_code != 0:
         logger.warning(
-            "Couldn't check if this is the latest version of convert2rhel\n"
-            "repoquery failed %s, %s" % (return_code, raw_output_convert2rhel_versions)
+            "Couldn't check if the current installed Convert2RHEL is the latest version.\n"
+            "repoquery failed with the following output:\n%s" % (raw_output_convert2rhel_versions)
         )
         return
 
-    PKG_NEVR = r"\b(\S+)-(?:([0-9]+):)?(\S+)-(\S+)\b"
     convert2rhel_versions = re.findall(PKG_NEVR, raw_output_convert2rhel_versions, re.MULTILINE)
-    latest_version = ("0", "0.00", "0")
+    logger.debug("Found %s convert2rhel package(s)" % len(convert2rhel_versions))
+    latest_available_version = ("0", "0.00", "0")
 
+    # This loop will determine the latest available convert2rhel version in the yum repo.
+    # It assigns the epoch, version, and release ex: ("0", "0.26", "1.el7") to the latest_available_version variable.
     for package_version in convert2rhel_versions:
-        # rpm.lableCompare(pkg1, pkg2) compare two kernel version strings and return
-        # -1 if str2 is greater then str1, 0 if they are equal, 1 if str1 is greater the str2
-        ver_compare = rpm.labelCompare(package_version[1:], latest_version)
+        # rpm.labelCompare(pkg1, pkg2) compare two package version strings and return
+        # -1 if latest_version is greater than package_version, 0 if they are equal, 1 if package_version is greater than latest_version
+        ver_compare = rpm.labelCompare(package_version[1:], latest_available_version)
         if ver_compare > 0:
-            latest_version = package_version[1:]
+            logger.debug(
+                "...convert2rhel version %s is newer than %s, updating latest_available_version variable"
+                % (package_version[1:][1], latest_available_version[1])
+            )
+            latest_available_version = package_version[1:]
 
-    # After the for loop latest_version will have the epoch ,version, and release ex:("0" "0.26" "1.el7") information from convert2rhel yum repo.
-    # the release for latest_verion will be "1.el7" and the relase for convert2rhel_version will be hard coded as "0" below,
-    # therefore when the versions are the same the latest_version's release field will cause it to evaluate as later
-    ver_compare = rpm.labelCompare(("0", convert2rhel_version, "0"), ("0", latest_version[1], "0"))
+    # After the for loop, the latest_available_version variable will gain the epoch, version, and release
+    # (e.g. ("0" "0.26" "1.el7")) information from the Convert2RHEL yum repo
+    # when the versions are the same the latest_available_version's release field will cause it to evaluate as a later version.
+    # Therefore we need to hardcode "0" for both the epoch and release below for installed_convert2rhel_version
+    # and latest_available_version respectively, to compare **just** the version field.
+    ver_compare = rpm.labelCompare(("0", installed_convert2rhel_version, "0"), ("0", latest_available_version[1], "0"))
     if ver_compare < 0:
-        if "CONVERT2RHEL_UNSUPPORTED_VERSION" in os.environ:
+        if "CONVERT2RHEL_ALLOW_OLDER_VERSION" in os.environ:
             logger.warning(
-                "You are currently running %s and the latest version of convert2rhel is %s.\n"
-                "'CONVERT2RHEL_UNSUPPORTED_VERSION' environment detected, continuing conversion"
-                % (convert2rhel_version, latest_version[1])
+                "You are currently running %s and the latest version of Convert2RHEL is %s.\n"
+                "'CONVERT2RHEL_ALLOW_OLDER_VERSION' environment variable detected, continuing conversion"
+                % (installed_convert2rhel_version, latest_available_version[1])
             )
 
         else:
             if int(system_info.version.major) <= 6:
                 logger.warning(
-                    "You are currently running %s and the latest version of convert2rhel is %s.\n"
-                    "Only the latest version is supported for conversion." % (convert2rhel_version, latest_version[1])
+                    "You are currently running %s and the latest version of Convert2RHEL is %s.\n"
+                    "We encourage you to update to the latest version."
+                    % (installed_convert2rhel_version, latest_available_version[1])
                 )
 
             else:
                 logger.critical(
-                    "You are currently running %s and the latest version of convert2rhel is %s.\n"
+                    "You are currently running %s and the latest version of Convert2RHEL is %s.\n"
                     "Only the latest version is supported for conversion. If you want to ignore"
-                    " this you can set 'CONVERT2RHEL_UNSUPPORTED_VERSION' to continue"
-                    % (convert2rhel_version, latest_version[1])
+                    " this check, then set the environment variable 'CONVERT2RHEL_ALLOW_OLDER_VERSION=1' to continue."
+                    % (installed_convert2rhel_version, latest_available_version[1])
                 )
 
     else:
-        logger.debug("Latest available convert2rhel version is installed.\n" "Continuing conversion.")
+        logger.debug("Latest available Convert2RHEL version is installed.\n" "Continuing conversion.")
 
 
 def check_efi():
@@ -201,18 +271,20 @@ def check_tainted_kmods():
         multipath 20480 0 - Live 0x0000000000000000
         linear 20480 0 - Live 0x0000000000000000
         system76_io 16384 0 - Live 0x0000000000000000 (OE)  <<<<<< Tainted
-        system76_acpi 16384 0 - Live 0x0000000000000000 (OE) <<<<< Tainted
+        system76_acpi 16384 0 - Live 0x0000000000000000 (OE) <<<<<< Tainted
     """
     logger.task("Prepare: Checking if loaded kernel modules are not tainted")
     unsigned_modules, _ = run_subprocess(["grep", "(", "/proc/modules"])
     module_names = "\n  ".join([mod.split(" ")[0] for mod in unsigned_modules.splitlines()])
     if unsigned_modules:
         logger.critical(
-            "Tainted kernel module(s) detected. "
+            "Tainted kernel modules detected:\n  {0}\n"
             "Third-party components are not supported per our "
-            "software support policy\n{0}\n\n"
-            "Uninstall or disable the following module(s) and run convert2rhel "
-            "again to continue with the conversion:\n  {1}".format(LINK_KMODS_RH_POLICY, module_names)
+            "software support policy:\n {1}\n"
+            "Prevent the modules from loading by following {2}"
+            " and run convert2rhel again to continue with the conversion.".format(
+                module_names, LINK_KMODS_RH_POLICY, LINK_PREVENT_KMODS_FROM_LOADING
+            )
         )
     logger.info("No tainted kernel module is loaded.")
 
@@ -260,7 +332,9 @@ def check_custom_repos_are_valid():
         return
 
     output, ret_code = call_yum_cmd(
-        command="makecache", args=["-v", "--setopt=*.skip_if_unavailable=False"], print_output=False
+        command="makecache",
+        args=["-v", "--setopt=*.skip_if_unavailable=False"],
+        print_output=False,
     )
     if ret_code != 0:
         logger.critical(
@@ -273,11 +347,19 @@ def check_custom_repos_are_valid():
 
 
 def ensure_compatibility_of_kmods():
-    """Ensure if the host kernel modules are compatible with RHEL."""
+    """Ensure that the host kernel modules are compatible with RHEL.
+
+    :raises SystemExit: Interrupts the conversion because some kernel modules are not supported in RHEL.
+    """
     host_kmods = get_loaded_kmods()
     rhel_supported_kmods = get_rhel_supported_kmods()
     unsupported_kmods = get_unsupported_kmods(host_kmods, rhel_supported_kmods)
-    if unsupported_kmods:
+
+    # Validate the best case first. If we don't have any unsupported_kmods, this means
+    # that everything is compatible and good to go.
+    if not unsupported_kmods:
+        logger.debug("All loaded kernel modules are available in RHEL.")
+    else:
         not_supported_kmods = "\n".join(
             map(
                 lambda kmod: "/lib/modules/{kver}/{kmod}".format(kver=system_info.booted_kernel, kmod=kmod),
@@ -285,14 +367,22 @@ def ensure_compatibility_of_kmods():
             )
         )
         logger.critical(
-            (
-                "The following kernel modules are not supported in RHEL:\n{kmods}\n"
-                "Make sure you have updated the kernel to the latest available version and rebooted the system. "
-                "Remove the unsupported modules and run convert2rhel again to continue with the conversion."
-            ).format(kmods=not_supported_kmods, system=system_info.name)
+            "The following loaded kernel modules are not available in RHEL:\n{0}\n"
+            "First, make sure you have updated the kernel to the latest available version and rebooted the system.\n"
+            "If this message appears again after doing the above, prevent the modules from loading by following {1}"
+            " and run convert2rhel again to continue with the conversion.".format(
+                "\n".join(not_supported_kmods), LINK_PREVENT_KMODS_FROM_LOADING
+            )
         )
-    else:
-        logger.info("Kernel modules are compatible.")
+
+
+def validate_package_manager_transaction():
+    """Validate the package manager transaction is passing the tests."""
+    logger.task("Validate the %s transaction", pkgmanager.TYPE)
+    transaction_handler = pkgmanager.create_transaction_handler()
+    transaction_handler.run_transaction(
+        validate_transaction=True,
+    )
 
 
 def get_loaded_kmods():
@@ -381,64 +471,46 @@ def get_most_recent_unique_kernel_pkgs(pkgs):
     kernel pkg do not deprecate kernel modules we only select
     the most recent ones.
 
-    All RHEL kmods packages starts with kernel* or kmod*
+    .. note::
+        All RHEL kmods packages starts with kernel* or kmod*
 
-    For example, we have the following packages list:
-        kernel-core-0:4.18.0-240.10.1.el8_3.x86_64
-        kernel-core-0:4.19.0-240.10.1.el8_3.x86_64
-        kmod-debug-core-0:4.18.0-240.10.1.el8_3.x86_64
-        kmod-debug-core-0:4.18.0-245.10.1.el8_3.x86_64
-    ==> (output of this function will be)
-        kernel-core-0:4.19.0-240.10.1.el8_3.x86_64
-        kmod-debug-core-0:4.18.0-245.10.1.el8_3.x86_64
+    For example, consider the following list of packages::
 
-    _repos_version_key extract the version of a package
-        into the tuple, i.e.
-        kernel-core-0:4.18.0-240.10.1.el8_3.x86_64 ==>
-        (4, 15, 0, 240, 10, 1)
-
-
-    :type pkgs: Iterable[str]
-    :type pkgs_groups:
-        Iterator[
-            Tuple[
-                package_name_without_version,
-                Iterator[package_name, ...],
-                ...,
-            ]
+        list_of_pkgs = [
+            'kernel-core-0:4.18.0-240.10.1.el8_3.x86_64',
+            'kernel-core-0:4.19.0-240.10.1.el8_3.x86_64',
+            'kmod-debug-core-0:4.18.0-240.10.1.el8_3.x86_64',
+            'kmod-debug-core-0:4.18.0-245.10.1.el8_3.x86_64
         ]
+
+    And when this function gets called with that same list of packages,
+    we have the following output::
+
+        result = get_most_recent_unique_kernel_pkgs(pkgs=list_of_pkgs)
+        print(result)
+        # (
+        #   'kernel-core-0:4.19.0-240.10.1.el8_3.x86_64',
+        #   'kmod-debug-core-0:4.18.0-245.10.1.el8_3.x86_64'
+        # )
+
+    :param pkgs: A list of package names to be analyzed.
+    :type pkgs: list[str]
+    :return: A tuple of packages name sorted and normalized
+    :rtype: tuple[str]
     """
 
     pkgs_groups = itertools.groupby(sorted(pkgs), lambda pkg_name: pkg_name.split(":")[0])
-    return tuple(
-        max(distinct_kernel_pkgs[1], key=_repos_version_key)
-        for distinct_kernel_pkgs in pkgs_groups
-        if distinct_kernel_pkgs[0].startswith(("kernel", "kmod"))
-    )
-
-
-def _repos_version_key(pkg_name):
-    try:
-        rpm_version = KERNEL_REPO_RE.search(pkg_name).group("version")
-    except AttributeError:
-        logger.critical(
-            "Unexpected package:\n%s\n is a source of kernel modules.",
-            pkg_name,
-        )
-    else:
-        return tuple(
-            map(
-                _convert_to_int_or_zero,
-                KERNEL_REPO_VER_SPLIT_RE.split(rpm_version),
+    list_of_sorted_pkgs = []
+    for distinct_kernel_pkgs in pkgs_groups:
+        if distinct_kernel_pkgs[0].startswith(("kernel", "kmod")):
+            list_of_sorted_pkgs.append(
+                max(
+                    distinct_kernel_pkgs[1],
+                    key=cmp_to_key(_package_version_cmp),
+                )
             )
-        )
 
-
-def _convert_to_int_or_zero(s):
-    try:
-        return int(s)
-    except ValueError:
-        return 0
+    return tuple(list_of_sorted_pkgs)
 
 
 def get_rhel_kmods_keys(rhel_kmods_str):
@@ -452,11 +524,19 @@ def get_rhel_kmods_keys(rhel_kmods_str):
 
 
 def get_unsupported_kmods(host_kmods, rhel_supported_kmods):
-    """Return a set of those installed kernel modules that are not available in RHEL repositories.
+    """Return a set of full paths to those installed kernel modules that are
+    not available in RHEL repositories.
 
-    Ignore certain kmods mentioned in the system configs. These kernel modules moved to kernel core, meaning that the
-    functionality is retained and we would be incorrectly saying that the modules are not supported in RHEL."""
-    return host_kmods - rhel_supported_kmods - set(system_info.kmods_to_ignore)
+    Ignore certain kmods mentioned in the system configs. These kernel modules
+    moved to kernel core, meaning that the functionality is retained and we
+    would be incorrectly saying that the modules are not supported in RHEL.
+    """
+    unsupported_kmods_subpaths = host_kmods - rhel_supported_kmods - set(system_info.kmods_to_ignore)
+    unsupported_kmods_full_paths = [
+        "/lib/modules/{kver}/{kmod}".format(kver=system_info.booted_kernel, kmod=kmod)
+        for kmod in unsupported_kmods_subpaths
+    ]
+    return unsupported_kmods_full_paths
 
 
 def check_rhel_compatible_kernel_is_used():
@@ -517,7 +597,10 @@ def _bad_kernel_version(kernel_release):
 def _bad_kernel_package_signature(kernel_release):
     """Return True if the booted kernel is not signed by the original OS vendor, i.e. it's a custom kernel."""
     vmlinuz_path = "/boot/vmlinuz-%s" % kernel_release
-    kernel_pkg, return_code = run_subprocess(["rpm", "-qf", "--qf", "%{NAME}", vmlinuz_path], print_output=False)
+    kernel_pkg, return_code = run_subprocess(
+        ["rpm", "-qf", "--qf", "%{NAME}", vmlinuz_path],
+        print_output=False,
+    )
     logger.debug("Booted kernel package name: {0}".format(kernel_pkg))
 
     os_vendor = system_info.name.split()[0]
@@ -620,7 +703,7 @@ def is_loaded_kernel_latest():
         logger.warning("Skipping the check as no internet connection has been detected.")
         return
 
-    cmd = ["repoquery", "--quiet", "--qf", '"%{BUILDTIME}\\t%{VERSION}-%{RELEASE}\\t%{REPOID}"']
+    cmd = ["repoquery", '--setopt=exclude=""', "--quiet", "--qf", '"%{BUILDTIME}\\t%{VERSION}-%{RELEASE}\\t%{REPOID}"']
 
     # If the reposdir variable is not empty, meaning that it detected the hardcoded repofiles, we should use that
     # instead of the system repositories located under /etc/yum.repos.d

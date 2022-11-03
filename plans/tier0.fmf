@@ -57,6 +57,11 @@
     how: ansible
     playbook: tests/ansible_collections/roles/install-submgr/main.yml
 
+/check_internet_connection:
+  discover+:
+    test: check-internet-connection
+
 /log_command_verification:
   discover+:
     test: log-command
+    

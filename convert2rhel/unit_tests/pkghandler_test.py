@@ -26,10 +26,6 @@ import pytest
 import rpm
 import six
 
-
-six.add_move(six.MovedModule("mock", "mock", "unittest.mock"))
-from six.moves import mock
-
 from convert2rhel import backup, pkghandler, pkgmanager, unit_tests, utils  # Imports unit_tests/__init__.py
 from convert2rhel.pkghandler import (
     _get_packages_to_update_dnf,
@@ -39,7 +35,11 @@ from convert2rhel.pkghandler import (
 from convert2rhel.systeminfo import system_info
 from convert2rhel.toolopts import tool_opts
 from convert2rhel.unit_tests import GetLoggerMocked, is_rpm_based_os, run_subprocess_side_effect
-from convert2rhel.unit_tests.conftest import TestPkgObj, all_systems, centos8, create_pkg_obj
+from convert2rhel.unit_tests.conftest import TestPkgObj, all_systems, centos7, centos8, create_pkg_obj
+
+
+six.add_move(six.MovedModule("mock", "mock", "unittest.mock"))
+from six.moves import mock
 
 
 class TestPkgHandler(unit_tests.ExtendedTestCase):
@@ -394,9 +394,10 @@ class TestPkgHandler(unit_tests.ExtendedTestCase):
         GetInstalledPkgsWFingerprintsMocked(),
     )
     def test_get_installed_pkgs_by_fingerprint_correct_fingerprint(self):
+        system_info.version = namedtuple("Version", ["major", "minor"])(7, 0)
         pkgs_by_fingerprint = pkghandler.get_installed_pkgs_by_fingerprint("199e2f91fd431d51")
 
-        self.assertEqual(pkgs_by_fingerprint, ["pkg1", "gpg-pubkey"])
+        self.assertEqual(pkgs_by_fingerprint, ["pkg1.", "gpg-pubkey."])
 
     @unit_tests.mock(
         pkghandler,
@@ -823,30 +824,6 @@ class TestPkgHandler(unit_tests.ExtendedTestCase):
             self.cmd += "%s\n" % cmd
             self.pkgs += [pkgs]
 
-    @unit_tests.mock(utils, "ask_to_continue", DumbCallableObject())
-    @unit_tests.mock(pkghandler, "get_installed_pkgs_by_fingerprint", lambda x: ["pkg"])
-    @unit_tests.mock(system_info, "version", namedtuple("Version", ["major", "minor"])(7, 0))
-    @unit_tests.mock(pkghandler, "call_yum_cmd_w_downgrades", CallYumCmdWDowngradesMocked())
-    def test_replace_non_red_hat_packages_distrosync_execution_order(self):
-        pkghandler.replace_non_red_hat_packages()
-
-        output = "update\nreinstall\ndistro-sync\n"
-        self.assertTrue(pkghandler.call_yum_cmd_w_downgrades.cmd == output)
-
-    @unit_tests.mock(utils, "ask_to_continue", DumbCallableObject())
-    @unit_tests.mock(pkghandler, "get_installed_pkgs_by_fingerprint", lambda x: ["pkg"])
-    @unit_tests.mock(system_info, "id", "oracle")
-    @unit_tests.mock(system_info, "version", namedtuple("Version", ["major", "minor"])(6, 0))
-    @unit_tests.mock(pkghandler, "call_yum_cmd_w_downgrades", CallYumCmdWDowngradesMocked())
-    def test_replace_non_red_hat_packages_distrosync_on_ol6(self):
-        pkghandler.replace_non_red_hat_packages()
-
-        for i in range(0, 3):
-            self.assertEqual(
-                ["pkg", "subscription-manager*"],
-                pkghandler.call_yum_cmd_w_downgrades.pkgs[i],
-            )
-
     @unit_tests.mock(system_info, "version", namedtuple("Version", ["major", "minor"])(7, 0))
     @unit_tests.mock(system_info, "releasever", None)
     @unit_tests.mock(pkghandler, "install_rhel_kernel", lambda: True)
@@ -867,28 +844,6 @@ class TestPkgHandler(unit_tests.ExtendedTestCase):
 
         self.assertEqual(utils.run_subprocess.cmd, ["yum", "update", "-y", "kernel"])
         self.assertEqual(pkghandler.get_installed_pkgs_by_fingerprint.called, 1)
-
-    gpg_keys_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "data", "version-independent"))
-
-    @unit_tests.mock(utils, "DATA_DIR", gpg_keys_dir)
-    @unit_tests.mock(utils, "run_subprocess", RunSubprocessMocked())
-    def test_install_gpg_keys(self):
-        pkghandler.install_gpg_keys()
-
-        gpg_dir = os.path.realpath(
-            os.path.join(
-                os.path.dirname(__file__),
-                "../data/version-independent/gpg-keys/*",
-            )
-        )
-        gpg_keys = glob.glob(gpg_dir)
-
-        self.assertNotEqual(len(gpg_keys), 0)
-        for gpg_key in gpg_keys:
-            self.assertIn(
-                ["rpm", "--import", os.path.join(gpg_dir, gpg_key)],
-                utils.run_subprocess.cmds,
-            )
 
     class GetInstalledPkgsWDifferentFingerprintMocked(unit_tests.MockFunction):
         def __init__(self):
@@ -1878,6 +1833,49 @@ def test_find_pkg_names_no_names(output, message):
     assert pkghandler.find_pkg_names(output, message) == set()
 
 
+class TestInstallGpgKeys(object):
+    data_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "../data/version-independent"))
+    gpg_keys_dir = os.path.join(data_dir, "gpg-keys")
+
+    def test_install_gpg_keys(self, monkeypatch, global_backup_control):
+        monkeypatch.setattr(utils, "DATA_DIR", self.data_dir)
+
+        # Prevent RestorableRpmKey from actually performing any work
+        enable_mock = mock.Mock()
+        monkeypatch.setattr(backup.RestorableRpmKey, "enable", enable_mock)
+
+        pkghandler.install_gpg_keys()
+
+        # Get the filenames for every gpg key registered with backup_control
+        restorable_keys = set()
+        for key in global_backup_control._restorables:
+            restorable_keys.add(key.keyfile)
+
+        gpg_file_glob = os.path.join(self.gpg_keys_dir, "*")
+        gpg_keys = glob.glob(gpg_file_glob)
+
+        # Make sure we have some keys in the data dir to check
+        assert len(gpg_keys) != 0
+
+        # check that all of the keys from data_dir have been registered with the backup_control.
+        # We'll test what the restorable keys do in backup_test (for the RestorableKey class)
+        assert len(restorable_keys) == len(global_backup_control._restorables)
+        for gpg_key in gpg_keys:
+            assert gpg_key in restorable_keys
+
+    def test_install_gpg_keys_fail_create_restorable(self, monkeypatch, tmpdir, global_backup_control):
+        keys_dir = os.path.join(str(tmpdir), "gpg-keys")
+        os.mkdir(keys_dir)
+        bad_gpg_key_filename = os.path.join(keys_dir, "bad-key")
+        with open(bad_gpg_key_filename, "w") as f:
+            f.write("BAD_DATA")
+
+        monkeypatch.setattr(utils, "DATA_DIR", str(tmpdir))
+
+        with pytest.raises(SystemExit, match="Importing the GPG key into rpm failed:\n .*"):
+            pkghandler.install_gpg_keys()
+
+
 @pytest.mark.parametrize(
     (
         "packages",
@@ -1927,3 +1925,47 @@ def test_clean_yum_metadata(ret_code, expected, monkeypatch, caplog):
 
     pkghandler.clean_yum_metadata()
     assert expected in caplog.records[-1].message
+
+
+@all_systems
+def test_get_system_packages_for_replacement(pretend_os, monkeypatch):
+    pkgs = ["pkg-1", "pkg-2"]
+    monkeypatch.setattr(pkghandler, "get_installed_pkgs_by_fingerprint", value=lambda _: pkgs)
+
+    result = pkghandler.get_system_packages_for_replacement()
+    for pkg in pkgs:
+        assert pkg in result
+
+
+@pytest.mark.parametrize(
+    ("pkg_1", "pkg_2", "expected"),
+    (
+        (
+            "kernel-core-0:4.18.0-240.10.1.el8_3.x86_64",
+            "kernel-core-0:4.18.0-240.15.1.el8_3.x86_64",
+            -1,
+        ),
+        (
+            "kmod-core-0:4.18.0-240.15.1.el8_3.x86_64",
+            "kmod-core-0:4.18.0-240.10.1.el8_3.x86_64",
+            1,
+        ),
+        (
+            "kmod-core-0:4.18.0-240.15.1.el8_3.x86_64",
+            "kmod-core-0:4.18.0-240.15.1.el8_3.x86_64",
+            0,
+        ),
+        (
+            "no-arch-0:4.18.0-240.15.1.el8_3",
+            "no-arch-0:4.18.0-240.15.1.el8_3",
+            0,
+        ),
+        (
+            "kmod-core-0.4.18.0-240.15.1.el8_3.x86_64",
+            "kmod-core-0.4.18.0-240.15.1.el8_3.x86_64",
+            0,
+        ),
+    ),
+)
+def test__package_version_cmp(pkg_1, pkg_2, expected):
+    assert pkghandler._package_version_cmp(pkg_1, pkg_2) == expected
